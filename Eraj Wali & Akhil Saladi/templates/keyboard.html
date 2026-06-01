@@ -1,0 +1,1446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Virtual Keyboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+
+    <!-- WebGazer -->
+    <script src="https://webgazer.cs.brown.edu/webgazer.js" defer></script>
+
+    <!-- MediaPipe FaceMesh for blink detection -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" defer></script>
+
+    <style>
+        .gaze-hover {
+            outline: 3px solid #1e90ff !important;
+            transform: scale(1.04);
+            box-shadow: 0 0 10px rgba(30, 144, 255, 0.75) !important;
+        }
+
+        .gaze-fixating {
+            box-shadow: 0 0 0 5px rgba(30, 144, 255, 0.25), 0 0 14px rgba(30, 144, 255, 0.9) !important;
+        }
+
+        #tracking-status {
+            position: fixed;
+            top: 8px;
+            right: 128px;
+            z-index: 100001;
+            padding: 8px 12px;
+            background: rgba(0, 80, 160, 0.85);
+            color: #fff;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 600;
+            pointer-events: none;
+            max-width: 260px;
+            line-height: 1.25;
+        }
+
+        #recalibrate-btn {
+            position: fixed;
+            top: 58px;
+            right: 128px;
+            z-index: 100001;
+            padding: 8px 12px;
+            border-radius: 10px;
+            border: none;
+            background: #1e90ff;
+            color: white;
+            font-size: 14px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        #recalibrate-btn:hover {
+            filter: brightness(1.08);
+        }
+    </style>
+</head>
+
+<body>
+    <!-- TOP TEXT BOX -->
+    <textarea id="text-box" placeholder="Use the Keyboard below to type in this box. When you start, this message will disappear"></textarea>
+
+    <!-- SUGGESTION BAR -->
+    <div id="suggestion-bar"></div>
+
+    <!-- TRACKING STATUS + RECALIBRATION -->
+    <div id="tracking-status">Calibrate gaze by clicking each dot 3 times.</div>
+    <button id="recalibrate-btn" type="button">Recalibrate</button>
+
+    <!-- KEYBOARD AREA -->
+    <div id="keyboard"></div>
+
+    <!-- GAZE DOT -->
+    <div id="gazeDot"></div>
+
+    <script>
+    /**********************************************************************
+     * KEYBOARD
+     **********************************************************************/
+    const keyboardLayout = [
+        ['q','w','e','r','t','y','u','i','o','p'],
+        ['a','s','d','f','g','h','j','k','l'],
+        ['CapsLock','z','x','c','v','b','n','m','Backspace'],
+        ['Space','Enter']
+    ];
+
+    const keyboard = document.getElementById('keyboard');
+    const textBox = document.getElementById('text-box');
+    const suggestionBar = document.getElementById('suggestion-bar');
+    const trackingStatus = document.getElementById('tracking-status');
+    const recalibrateBtn = document.getElementById('recalibrate-btn');
+
+    let capsLock = false;
+    let calibrationComplete = false;
+
+    keyboardLayout.forEach(row => {
+        const rowDiv = document.createElement('div');
+        rowDiv.classList.add('row');
+
+        row.forEach(key => {
+            const button = document.createElement('button');
+            button.type = "button";
+            button.textContent = key;
+
+            if (['Backspace', 'Enter', 'CapsLock', 'Space'].includes(key)) {
+                button.classList.add('wide');
+            }
+
+            button.addEventListener('click', () => handleKeyPress(key, button));
+            rowDiv.appendChild(button);
+        });
+
+        keyboard.appendChild(rowDiv);
+    });
+
+    function handleKeyPress(key, button) {
+        switch (key) {
+            case 'Backspace':
+                textBox.value = textBox.value.slice(0, -1);
+                break;
+            case 'Enter':
+                textBox.value += '\n';
+                break;
+            case 'Space':
+                textBox.value += ' ';
+                break;
+            case 'CapsLock':
+                capsLock = !capsLock;
+                button.classList.toggle('caps-active', capsLock);
+                break;
+            default:
+                textBox.value += (capsLock ? key.toUpperCase() : key);
+                break;
+        }
+
+        textBox.focus();
+        updateSuggestions();
+    }
+
+    textBox.addEventListener('input', updateSuggestions);
+
+    /**********************************************************************
+     * PREDICTIVE TEXT
+     **********************************************************************/
+    const DICT_API_URL = "https://api.datamuse.com/words";
+    const SUGGESTION_LIMIT = 5;
+    const DICT_FETCH_LIMIT = 40;
+
+    let lastQuery = "";
+    let lastFetchController = null;
+    let debounceTimer = null;
+
+    function getCurrentPrefix(text) {
+        const trimmed = text.replace(/\s+$/g, "");
+        if (!trimmed) return "";
+
+        const parts = trimmed.split(/\s+/);
+        let token = parts[parts.length - 1] || "";
+        token = token.replace(/^[^a-zA-Z']+|[^a-zA-Z']+$/g, "");
+        return token.toLowerCase();
+    }
+
+    function getLeftContext(text) {
+        const trimmed = text.replace(/\s+$/g, "");
+        if (!trimmed) return "";
+
+        const parts = trimmed.split(/\s+/);
+        if (parts.length < 2) return "";
+
+        let prev = parts[parts.length - 2] || "";
+        prev = prev.replace(/^[^a-zA-Z']+|[^a-zA-Z']+$/g, "");
+        return prev.toLowerCase();
+    }
+
+    function extractFreqZipf(obj) {
+        if (!obj || !Array.isArray(obj.tags)) return null;
+
+        for (const t of obj.tags) {
+            if (typeof t === "string" && t.startsWith("f:")) {
+                const val = parseFloat(t.slice(2));
+                if (!Number.isNaN(val)) return val;
+            }
+        }
+
+        return null;
+    }
+
+    function normalizedWord(word) {
+        return String(word || "").toLowerCase().replace(/[^a-z']/g, "");
+    }
+
+    function uniqueValues(values) {
+        return [...new Set(values.filter(v => v != null))];
+    }
+
+    function editDistance(a, b, maxDistance = Infinity) {
+        if (Math.abs(a.length - b.length) > maxDistance) return maxDistance + 1;
+
+        let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+
+        for (let i = 1; i <= a.length; i++) {
+            const curr = [i];
+            let rowMin = curr[0];
+
+            for (let j = 1; j <= b.length; j++) {
+                const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+                const val = Math.min(
+                    prev[j] + 1,
+                    curr[j - 1] + 1,
+                    prev[j - 1] + cost
+                );
+
+                curr[j] = val;
+                rowMin = Math.min(rowMin, val);
+            }
+
+            if (rowMin > maxDistance) return maxDistance + 1;
+            prev = curr;
+        }
+
+        return prev[b.length];
+    }
+
+    function maxTypoDistance(prefix) {
+        if (prefix.length < 3) return 0;
+        if (prefix.length < 6) return 1;
+        return 2;
+    }
+
+    function prefixEditDistance(prefix, word) {
+        const wl = normalizedWord(word);
+        const maxDistance = maxTypoDistance(prefix);
+        const candidateLengths = uniqueValues([
+            prefix.length - 1,
+            prefix.length,
+            prefix.length + 1
+        ]).filter(len => len > 0 && len <= wl.length);
+
+        if (!candidateLengths.length && wl) candidateLengths.push(wl.length);
+
+        return Math.min(...candidateLengths.map(len => (
+            editDistance(prefix, wl.slice(0, len), maxDistance)
+        )));
+    }
+
+    function suggestionMatch(prefix, word) {
+        const wl = normalizedWord(word);
+        if (!wl) return null;
+        if (wl.startsWith(prefix)) return { exact: true, distance: 0 };
+
+        const distance = prefixEditDistance(prefix, wl);
+        const maxDistance = maxTypoDistance(prefix);
+
+        if (distance <= maxDistance) return { exact: false, distance };
+        return null;
+    }
+
+    function wildcardPatterns(prefix) {
+        if (prefix.length < 3) return [];
+
+        const patterns = [];
+        const replaceIndexes = uniqueValues([
+            0,
+            Math.floor(prefix.length / 2),
+            prefix.length - 1
+        ]);
+
+        replaceIndexes.forEach(i => {
+            patterns.push(prefix.slice(0, i) + "?" + prefix.slice(i + 1) + "*");
+        });
+
+        if (prefix.length >= 4) {
+            const insertIndexes = uniqueValues([1, Math.floor(prefix.length / 2)]);
+            insertIndexes.forEach(i => {
+                patterns.push(prefix.slice(0, i) + "?" + prefix.slice(i) + "*");
+            });
+
+            const removeIndexes = uniqueValues([
+                Math.floor(prefix.length / 2),
+                prefix.length - 1
+            ]);
+
+            removeIndexes.forEach(i => {
+                patterns.push(prefix.slice(0, i) + prefix.slice(i + 1) + "*");
+            });
+        }
+
+        return uniqueValues(patterns).slice(0, 7);
+    }
+
+    function buildSuggestionUrls(prefix, leftContext) {
+        const requests = [{ sp: prefix + "*", source: "prefix" }];
+
+        wildcardPatterns(prefix).forEach(pattern => {
+            requests.push({ sp: pattern, source: "wildcard" });
+        });
+
+        if (prefix.length >= 3) {
+            requests.push({ sl: prefix, source: "sound" });
+        }
+
+        return requests.map(req => {
+            const params = new URLSearchParams();
+            params.set("max", String(DICT_FETCH_LIMIT));
+            params.set("md", "f");
+
+            if (req.sp) params.set("sp", req.sp);
+            if (req.sl) params.set("sl", req.sl);
+            if (leftContext) params.set("lc", leftContext);
+
+            return {
+                url: DICT_API_URL + "?" + params.toString(),
+                source: req.source
+            };
+        });
+    }
+
+    function clearSuggestions() {
+        suggestionBar.innerHTML = "";
+        lastQuery = "";
+    }
+
+    function updateSuggestions() {
+        const text = textBox.value;
+
+        if (!text || /\s$/.test(text)) {
+            clearSuggestions();
+            return;
+        }
+
+        const prefix = getCurrentPrefix(text);
+
+        if (!prefix || prefix.length < 2) {
+            clearSuggestions();
+            return;
+        }
+
+        if (prefix === lastQuery) return;
+
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => fetchSuggestions(prefix, text), 120);
+    }
+
+    async function fetchSuggestions(prefix, snapshotText) {
+        lastQuery = prefix;
+
+        if (lastFetchController) lastFetchController.abort();
+        lastFetchController = new AbortController();
+
+        const lc = getLeftContext(snapshotText);
+        const requests = buildSuggestionUrls(prefix, lc);
+
+        try {
+            const settledResponses = await Promise.allSettled(requests.map(req => (
+                fetch(req.url, { signal: lastFetchController.signal })
+                    .then(res => res.json())
+                    .then(data => ({ source: req.source, data }))
+            )));
+
+            const aborted = settledResponses.some(result => (
+                result.status === "rejected" && result.reason && result.reason.name === "AbortError"
+            ));
+            if (aborted) return;
+
+            const responses = settledResponses
+                .filter(result => result.status === "fulfilled")
+                .map(result => result.value);
+
+            if (!responses.length) {
+                throw new Error("No suggestion requests succeeded.");
+            }
+
+            const nowPrefix = getCurrentPrefix(textBox.value);
+            if (nowPrefix !== prefix) return;
+
+            const byWord = new Map();
+
+            responses.forEach(({ source, data }) => {
+                const arr = Array.isArray(data) ? data : [];
+                const sourceBoost =
+                    source === "prefix" ? 120 :
+                    source === "wildcard" ? 70 :
+                    45;
+
+                arr.forEach(obj => {
+                    if (!obj || typeof obj.word !== "string") return;
+
+                    const match = suggestionMatch(prefix, obj.word);
+                    if (!match) return;
+
+                    const wl = normalizedWord(obj.word);
+                    const freq = extractFreqZipf(obj);
+                    const apiScore = typeof obj.score === "number" ? obj.score : 0;
+                    const distancePenalty = match.distance * 180;
+                    const exactBoost = match.exact ? 280 : 0;
+                    const freqScore = (freq == null ? 0 : freq) * 45;
+                    const score =
+                        sourceBoost +
+                        exactBoost +
+                        freqScore +
+                        Math.log(apiScore + 1) * 20 -
+                        distancePenalty -
+                        Math.max(0, obj.word.length - prefix.length) * 2;
+
+                    const existing = byWord.get(wl);
+
+                    if (!existing || score > existing.score) {
+                        byWord.set(wl, {
+                            w: obj.word,
+                            freq,
+                            score,
+                            distance: match.distance
+                        });
+                    }
+                });
+            });
+
+            const scored = [...byWord.values()].sort((a, b) => {
+                if (b.score !== a.score) return b.score - a.score;
+
+                const af = (a.freq == null) ? -1 : a.freq;
+                const bf = (b.freq == null) ? -1 : b.freq;
+                if (bf !== af) return bf - af;
+
+                if (a.distance !== b.distance) return a.distance - b.distance;
+                return a.w.length - b.w.length;
+            });
+
+            renderSuggestions(scored.slice(0, SUGGESTION_LIMIT).map(x => x.w));
+        } catch (err) {
+            if (err.name === "AbortError") return;
+            console.error("Suggestion fetch error:", err);
+            suggestionBar.innerHTML = "";
+        }
+    }
+
+    function renderSuggestions(suggestions) {
+        suggestionBar.innerHTML = "";
+        if (!suggestions || suggestions.length === 0) return;
+
+        suggestions.forEach(word => {
+            const btn = document.createElement('button');
+            btn.type = "button";
+            btn.classList.add('suggestion-btn');
+            btn.textContent = word;
+            btn.addEventListener('click', () => applySuggestion(word));
+            suggestionBar.appendChild(btn);
+        });
+    }
+
+    function applySuggestion(word) {
+        const text = textBox.value;
+        const lastSpaceIndex = Math.max(text.lastIndexOf(' '), text.lastIndexOf('\n'));
+        const base = (lastSpaceIndex === -1) ? "" : text.slice(0, lastSpaceIndex + 1);
+
+        textBox.value = base + word + " ";
+        suggestionBar.innerHTML = "";
+        lastQuery = "";
+        textBox.focus();
+    }
+
+    /**********************************************************************
+     * GAZE FILTERING
+     **********************************************************************/
+    function clamp(v, lo, hi) {
+        return Math.max(lo, Math.min(hi, v));
+    }
+
+    function median(values) {
+        const arr = values.slice().sort((a, b) => a - b);
+        const mid = Math.floor(arr.length / 2);
+        return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+    }
+
+    function targetCenter(el) {
+        const r = el.getBoundingClientRect();
+        return {
+            x: r.left + r.width / 2,
+            y: r.top + r.height / 2
+        };
+    }
+
+    const recentRawSamples = [];
+    const calibrationSamples = [];
+    const MAX_RECENT_RAW_SAMPLES = 36;
+    const DRIFT_ALPHA = 0.012;
+    const DRIFT_MAX_PX = 150;
+    const DRIFT_SAMPLE_MAX_PX = 190;
+    let calibrationTransform = null;
+    let driftOffset = { x: 0, y: 0 };
+
+    const rawWindow = [];
+    const RAW_WINDOW_SIZE = 9;
+
+    let lastAccepted = null;
+    let lastTimestamp = null;
+    let lastFixationPoint = null;
+    let lastFixationTimestamp = null;
+    let rejectedJumpFrames = 0;
+
+    const MAX_SPEED_PX_PER_SEC = 1600;
+    const SUSTAINED_JUMP_FRAMES_REQUIRED = 3;
+    const BASE_ALPHA = 0.08;
+    const ALPHA_BOOST_AT_SPEED = 0.42;
+    const STILLNESS_DEADBAND_PX = 3;
+
+    let smooth = { x: 0, y: 0, inited: false };
+    let visualSmooth = { x: 0, y: 0, inited: false };
+
+    let latestGaze = { x: 0, y: 0 };              // slow red dot
+    let latestInteractionGaze = { x: 0, y: 0 };   // responsive targeting
+    let manualCursorMode = false;
+    let manualPointer = {
+        x: Math.round(window.innerWidth / 2),
+        y: Math.round(window.innerHeight / 2)
+    };
+
+    function rememberRawSample(point) {
+        if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+
+        recentRawSamples.push({ x: point.x, y: point.y, t: performance.now() });
+        if (recentRawSamples.length > MAX_RECENT_RAW_SAMPLES) recentRawSamples.shift();
+    }
+
+    function recentRawEstimate() {
+        const now = performance.now();
+        let samples = recentRawSamples.filter(sample => now - sample.t <= 450);
+        if (samples.length < 4) samples = recentRawSamples.slice(-8);
+        if (samples.length < 4) return null;
+
+        return {
+            x: median(samples.map(p => p.x)),
+            y: median(samples.map(p => p.y))
+        };
+    }
+
+    function solveLinear3x3(matrix, vector) {
+        const m = matrix.map((row, i) => row.concat(vector[i]));
+
+        for (let col = 0; col < 3; col++) {
+            let pivot = col;
+
+            for (let row = col + 1; row < 3; row++) {
+                if (Math.abs(m[row][col]) > Math.abs(m[pivot][col])) pivot = row;
+            }
+
+            if (Math.abs(m[pivot][col]) < 1e-8) return null;
+
+            if (pivot !== col) {
+                const tmp = m[col];
+                m[col] = m[pivot];
+                m[pivot] = tmp;
+            }
+
+            const pivotValue = m[col][col];
+
+            for (let j = col; j < 4; j++) m[col][j] /= pivotValue;
+
+            for (let row = 0; row < 3; row++) {
+                if (row === col) continue;
+
+                const factor = m[row][col];
+                for (let j = col; j < 4; j++) m[row][j] -= factor * m[col][j];
+            }
+        }
+
+        return [m[0][3], m[1][3], m[2][3]];
+    }
+
+    function buildAffineTransform(samples) {
+        if (samples.length < 6) return null;
+
+        const normal = [
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0]
+        ];
+        const bx = [0, 0, 0];
+        const by = [0, 0, 0];
+
+        samples.forEach(sample => {
+            const row = [sample.raw.x, sample.raw.y, 1];
+
+            for (let i = 0; i < 3; i++) {
+                bx[i] += row[i] * sample.screen.x;
+                by[i] += row[i] * sample.screen.y;
+
+                for (let j = 0; j < 3; j++) {
+                    normal[i][j] += row[i] * row[j];
+                }
+            }
+        });
+
+        const xCoeffs = solveLinear3x3(normal, bx);
+        const yCoeffs = solveLinear3x3(normal, by);
+
+        if (!xCoeffs || !yCoeffs) return null;
+        return { type: "affine", xCoeffs, yCoeffs };
+    }
+
+    function buildOffsetTransform(samples) {
+        if (!samples.length) return null;
+
+        return {
+            type: "offset",
+            dx: median(samples.map(sample => sample.screen.x - sample.raw.x)),
+            dy: median(samples.map(sample => sample.screen.y - sample.raw.y))
+        };
+    }
+
+    function recordCalibrationSample(screenPoint) {
+        const raw = recentRawEstimate();
+        if (!raw) return false;
+
+        const margin = Math.max(window.innerWidth, window.innerHeight);
+        const insideReasonableScreen =
+            raw.x >= -margin &&
+            raw.x <= window.innerWidth + margin &&
+            raw.y >= -margin &&
+            raw.y <= window.innerHeight + margin;
+
+        if (!insideReasonableScreen) return false;
+
+        calibrationSamples.push({
+            raw,
+            screen: screenPoint
+        });
+
+        return true;
+    }
+
+    function finalizeCalibrationModel() {
+        calibrationTransform = buildAffineTransform(calibrationSamples) || buildOffsetTransform(calibrationSamples);
+        driftOffset = { x: 0, y: 0 };
+        resetGazeFilters();
+
+        if (calibrationTransform) {
+            console.log("Calibration correction model:", calibrationTransform.type, calibrationSamples.length, "samples");
+        } else {
+            console.warn("Calibration correction model unavailable.");
+        }
+    }
+
+    function applyCalibrationCorrection(point) {
+        let x = point.x;
+        let y = point.y;
+
+        if (calibrationTransform && calibrationTransform.type === "affine") {
+            x =
+                calibrationTransform.xCoeffs[0] * point.x +
+                calibrationTransform.xCoeffs[1] * point.y +
+                calibrationTransform.xCoeffs[2];
+            y =
+                calibrationTransform.yCoeffs[0] * point.x +
+                calibrationTransform.yCoeffs[1] * point.y +
+                calibrationTransform.yCoeffs[2];
+        } else if (calibrationTransform) {
+            x += calibrationTransform.dx;
+            y += calibrationTransform.dy;
+        }
+
+        x += driftOffset.x;
+        y += driftOffset.y;
+
+        return {
+            x: clamp(x, 0, window.innerWidth),
+            y: clamp(y, 0, window.innerHeight)
+        };
+    }
+
+    function lockWebgazerTraining() {
+        try {
+            if (typeof webgazer.removeMouseEventListeners === "function") {
+                webgazer.removeMouseEventListeners();
+            }
+        } catch (e) {
+            console.warn("Could not remove WebGazer mouse listeners:", e);
+        }
+    }
+
+    function resetGazeFilters() {
+        rawWindow.length = 0;
+        lastAccepted = null;
+        lastTimestamp = null;
+        lastFixationPoint = null;
+        lastFixationTimestamp = null;
+        rejectedJumpFrames = 0;
+        smooth.inited = false;
+        visualSmooth.inited = false;
+        fixationFrames = 0;
+        pendingTarget = null;
+        pendingTargetFrames = 0;
+    }
+
+    function addToWindow(x, y) {
+        rawWindow.push({ x, y });
+        if (rawWindow.length > RAW_WINDOW_SIZE) rawWindow.shift();
+    }
+
+    function windowMedianPoint() {
+        const xs = rawWindow.map(p => p.x);
+        const ys = rawWindow.map(p => p.y);
+        return { x: median(xs), y: median(ys) };
+    }
+
+    function isOutlierBySpeed(candidate, ts) {
+        if (!lastAccepted || lastTimestamp == null) return false;
+
+        const dtMs = ts - lastTimestamp;
+        if (dtMs <= 0) return false;
+
+        const dx = candidate.x - lastAccepted.x;
+        const dy = candidate.y - lastAccepted.y;
+        const dist = Math.hypot(dx, dy);
+        const speed = dist / (dtMs / 1000);
+
+        if (speed <= MAX_SPEED_PX_PER_SEC) {
+            rejectedJumpFrames = 0;
+            return false;
+        }
+
+        rejectedJumpFrames++;
+
+        if (rejectedJumpFrames >= SUSTAINED_JUMP_FRAMES_REQUIRED) {
+            rejectedJumpFrames = 0;
+            return false;
+        }
+
+        return true;
+    }
+
+    function movementSpeed(candidate, ts) {
+        if (!lastAccepted || lastTimestamp == null) return 0;
+
+        const dtMs = Math.max(1, ts - lastTimestamp);
+        return Math.hypot(candidate.x - lastAccepted.x, candidate.y - lastAccepted.y) / (dtMs / 1000);
+    }
+
+    function filteredMovementSpeed(point, ts) {
+        if (!lastFixationPoint || lastFixationTimestamp == null) return 0;
+
+        const dtMs = Math.max(1, ts - lastFixationTimestamp);
+        return Math.hypot(point.x - lastFixationPoint.x, point.y - lastFixationPoint.y) / (dtMs / 1000);
+    }
+
+    function adaptiveAlpha(speedPxPerSec) {
+        const t = clamp(speedPxPerSec / MAX_SPEED_PX_PER_SEC, 0, 1);
+        return clamp(BASE_ALPHA + t * ALPHA_BOOST_AT_SPEED, 0.05, 0.85);
+    }
+
+    function emaUpdate(target, speed) {
+        if (!smooth.inited) {
+            smooth.x = target.x;
+            smooth.y = target.y;
+            smooth.inited = true;
+            return { x: smooth.x, y: smooth.y };
+        }
+
+        const dist = Math.hypot(target.x - smooth.x, target.y - smooth.y);
+        if (dist < STILLNESS_DEADBAND_PX) return { x: smooth.x, y: smooth.y };
+
+        const a = adaptiveAlpha(speed);
+        smooth.x = smooth.x + a * (target.x - smooth.x);
+        smooth.y = smooth.y + a * (target.y - smooth.y);
+
+        return { x: smooth.x, y: smooth.y };
+    }
+
+    function visualDotUpdate(target) {
+        if (!visualSmooth.inited) {
+            visualSmooth.x = target.x;
+            visualSmooth.y = target.y;
+            visualSmooth.inited = true;
+            return { x: visualSmooth.x, y: visualSmooth.y };
+        }
+
+        const VISUAL_DOT_ALPHA = 0.08;
+
+        visualSmooth.x = visualSmooth.x + VISUAL_DOT_ALPHA * (target.x - visualSmooth.x);
+        visualSmooth.y = visualSmooth.y + VISUAL_DOT_ALPHA * (target.y - visualSmooth.y);
+
+        return { x: visualSmooth.x, y: visualSmooth.y };
+    }
+
+    /**********************************************************************
+     * FIXATION + TARGETING
+     **********************************************************************/
+    const FIXATION_SPEED_PX_PER_SEC = 700;
+    const FIXATION_FRAMES_REQUIRED = 5;
+    const TARGET_RADIUS_PX = 160;
+    const TARGET_STICKY_MARGIN_PX = 70;
+    const TARGET_SWITCH_FRAMES_REQUIRED = 4;
+    const TARGET_SNAP_BLEND = 0.72;
+
+    let fixationFrames = 0;
+    let highlightedTarget = null;
+    let latestStableTarget = null;
+    let pendingTarget = null;
+    let pendingTargetFrames = 0;
+
+    function updateFixationState(speed) {
+        if (speed < FIXATION_SPEED_PX_PER_SEC) fixationFrames++;
+        else fixationFrames = 0;
+
+        return fixationFrames >= FIXATION_FRAMES_REQUIRED;
+    }
+
+    function getInteractiveTargets() {
+        return [...document.querySelectorAll('#keyboard button, .suggestion-btn')];
+    }
+
+    function getNearestTarget(x, y) {
+        let best = null;
+        let bestDist = Infinity;
+
+        for (const el of getInteractiveTargets()) {
+            const r = el.getBoundingClientRect();
+
+            const inside =
+                x >= r.left &&
+                x <= r.right &&
+                y >= r.top &&
+                y <= r.bottom;
+
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            const dist = inside ? 0 : Math.hypot(x - cx, y - cy);
+
+            if (dist < bestDist) {
+                best = el;
+                bestDist = dist;
+            }
+        }
+
+        if (best && bestDist <= TARGET_RADIUS_PX) return best;
+        return null;
+    }
+
+    function pointInExpandedTarget(el, x, y, margin) {
+        if (!el) return false;
+
+        const r = el.getBoundingClientRect();
+        return (
+            x >= r.left - margin &&
+            x <= r.right + margin &&
+            y >= r.top - margin &&
+            y <= r.bottom + margin
+        );
+    }
+
+    function getStableTarget(x, y) {
+        const nearest = getNearestTarget(x, y);
+
+        if (highlightedTarget && pointInExpandedTarget(highlightedTarget, x, y, TARGET_STICKY_MARGIN_PX)) {
+            pendingTarget = null;
+            pendingTargetFrames = 0;
+            return highlightedTarget;
+        }
+
+        if (nearest === highlightedTarget) {
+            pendingTarget = null;
+            pendingTargetFrames = 0;
+            return nearest;
+        }
+
+        if (nearest !== pendingTarget) {
+            pendingTarget = nearest;
+            pendingTargetFrames = 1;
+        } else {
+            pendingTargetFrames++;
+        }
+
+        if (!highlightedTarget || pendingTargetFrames >= TARGET_SWITCH_FRAMES_REQUIRED) {
+            return nearest;
+        }
+
+        return highlightedTarget;
+    }
+
+    function applyTargetStabilization(point, target, fixating) {
+        if (!target || !fixating) return point;
+
+        const center = targetCenter(target);
+
+        return {
+            x: point.x + TARGET_SNAP_BLEND * (center.x - point.x),
+            y: point.y + TARGET_SNAP_BLEND * (center.y - point.y)
+        };
+    }
+
+    function updateDriftCorrection(point, target, fixating) {
+        if (!calibrationComplete || !target || !fixating) return;
+
+        const center = targetCenter(target);
+        const dx = center.x - point.x;
+        const dy = center.y - point.y;
+
+        if (Math.hypot(dx, dy) > DRIFT_SAMPLE_MAX_PX) return;
+
+        driftOffset.x = clamp(driftOffset.x + dx * DRIFT_ALPHA, -DRIFT_MAX_PX, DRIFT_MAX_PX);
+        driftOffset.y = clamp(driftOffset.y + dy * DRIFT_ALPHA, -DRIFT_MAX_PX, DRIFT_MAX_PX);
+    }
+
+    function setTargetHighlight(target, fixating) {
+        if (highlightedTarget && highlightedTarget !== target) {
+            highlightedTarget.classList.remove('gaze-hover', 'gaze-fixating');
+        }
+
+        if (!target) {
+            if (highlightedTarget) highlightedTarget.classList.remove('gaze-hover', 'gaze-fixating');
+            highlightedTarget = null;
+            latestStableTarget = null;
+            return;
+        }
+
+        highlightedTarget = target;
+        highlightedTarget.classList.add('gaze-hover');
+        highlightedTarget.classList.toggle('gaze-fixating', fixating);
+
+        latestStableTarget = fixating ? target : latestStableTarget;
+    }
+
+    function updateTargeting(x, y, fixating, stableTarget) {
+        const target = arguments.length >= 4 ? stableTarget : getStableTarget(x, y);
+        setTargetHighlight(target, fixating);
+    }
+
+    function clickCurrentTarget() {
+        if (!calibrationComplete) return;
+
+        const target = latestStableTarget || highlightedTarget || getNearestTarget(latestInteractionGaze.x, latestInteractionGaze.y);
+
+        if (target) {
+            target.click();
+            trackingStatus.textContent = "Selected by blink.";
+            return;
+        }
+
+        trackingStatus.textContent = "Blink detected, but no target was selected.";
+    }
+
+    /**********************************************************************
+     * BLINK DETECTION WITH MEDIAPIPE FACEMESH
+     **********************************************************************/
+    let baselineEars = [];
+    let baselineEar = null;
+    let blinkFrames = 0;
+    let lastBlinkTime = 0;
+
+    const BASELINE_MS = 1800;
+    const BLINK_COOLDOWN_MS = 700;
+    const CLOSED_FRAMES_REQUIRED = 2;
+    const BLINK_RATIO = 0.68;
+
+    const LEFT_EYE = { p1: 33,  p2: 160, p3: 158, p4: 133, p5: 153, p6: 144 };
+    const RIGHT_EYE= { p1: 362, p2: 385, p3: 387, p4: 263, p5: 373, p6: 380 };
+
+    function dist(a, b) {
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        return Math.hypot(dx, dy);
+    }
+
+    function eyeEAR(lm, eye, w, h) {
+        const p1 = { x: lm[eye.p1].x * w, y: lm[eye.p1].y * h };
+        const p2 = { x: lm[eye.p2].x * w, y: lm[eye.p2].y * h };
+        const p3 = { x: lm[eye.p3].x * w, y: lm[eye.p3].y * h };
+        const p4 = { x: lm[eye.p4].x * w, y: lm[eye.p4].y * h };
+        const p5 = { x: lm[eye.p5].x * w, y: lm[eye.p5].y * h };
+        const p6 = { x: lm[eye.p6].x * w, y: lm[eye.p6].y * h };
+
+        const v1 = dist(p2, p6);
+        const v2 = dist(p3, p5);
+        const h1 = dist(p1, p4);
+
+        if (h1 < 1e-6) return 1.0;
+        return (v1 + v2) / (2 * h1);
+    }
+
+    function medianNum(arr) {
+        const a = arr.slice().sort((x, y) => x - y);
+        const m = Math.floor(a.length / 2);
+        return a.length % 2 ? a[m] : (a[m-1] + a[m]) / 2;
+    }
+
+    async function waitForWebgazerVideo(timeoutMs = 8000) {
+        const start = Date.now();
+
+        while (Date.now() - start < timeoutMs) {
+            const v = document.getElementById("webgazerVideoFeed") || document.querySelector("video");
+
+            if (v && v.readyState >= 2 && (v.videoWidth || 0) > 0) return v;
+            await new Promise(r => setTimeout(r, 100));
+        }
+
+        return null;
+    }
+
+    async function startBlinkDetection(faceMesh, videoEl) {
+        baselineEars = [];
+        baselineEar = null;
+
+        const t0 = Date.now();
+        trackingStatus.textContent = "Blink setup: keep eyes open for about 2 seconds.";
+
+        let facePending = false;
+
+        async function loop() {
+            if (!facePending) {
+                facePending = true;
+
+                try {
+                    await faceMesh.send({ image: videoEl });
+                } catch (e) {
+                    console.error("FaceMesh send error:", e);
+                }
+
+                facePending = false;
+            }
+
+            requestAnimationFrame(loop);
+        }
+
+        requestAnimationFrame(loop);
+
+        while (Date.now() - t0 < BASELINE_MS) {
+            await new Promise(r => setTimeout(r, 50));
+        }
+
+        if (baselineEars.length >= 10) {
+            baselineEar = medianNum(baselineEars);
+            console.log("Baseline EAR:", baselineEar.toFixed(3));
+            console.log("Blink threshold:", (baselineEar * BLINK_RATIO).toFixed(3));
+            trackingStatus.textContent = calibrationComplete
+                ? "Blink ready. Gaze to a button, then blink to select."
+                : "Blink ready. Finish gaze calibration.";
+        } else {
+            console.warn("Not enough baseline EAR samples.");
+            trackingStatus.textContent = "Blink setup had low samples. Recalibrate if blink does not work.";
+        }
+    }
+
+    /**********************************************************************
+     * LOGGING
+     **********************************************************************/
+    let MODE = "smoothed"; // "raw" or "smoothed"
+    let LOGGING = false;
+
+    const rawLog = [];
+    const smoothLog = [];
+
+    function toggleMode() {
+        MODE = (MODE === "smoothed") ? "raw" : "smoothed";
+        console.log("MODE:", MODE);
+    }
+
+    function toggleLogging() {
+        LOGGING = !LOGGING;
+        console.log("LOGGING:", LOGGING);
+
+        if (LOGGING) {
+            rawLog.length = 0;
+            smoothLog.length = 0;
+            console.log("Logs cleared. Start staring at a fixed point for ~10s.");
+        } else {
+            console.log("Logging stopped. raw:", rawLog.length, "smooth:", smoothLog.length);
+        }
+    }
+
+    function downloadJSON(filename, obj) {
+        const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+
+        a.href = url;
+        a.download = filename;
+
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        URL.revokeObjectURL(url);
+    }
+
+    function exportLogs() {
+        downloadJSON("gaze_raw.json", rawLog);
+        downloadJSON("gaze_smoothed.json", smoothLog);
+        console.log("Exported gaze_raw.json and gaze_smoothed.json");
+    }
+
+    function positionCameraOverlay(videoEl) {
+        if (!videoEl) return;
+
+        document.body.classList.add("camera-overlay-ready");
+        videoEl.setAttribute("aria-hidden", "true");
+
+        Object.assign(videoEl.style, {
+            display: "block",
+            position: "fixed",
+            top: "8px",
+            right: "10px",
+            left: "auto",
+            width: "104px",
+            height: "58px",
+            objectFit: "cover",
+            borderRadius: "10px",
+            zIndex: "100002",
+            pointerEvents: "none"
+        });
+    }
+
+    function moveGazeDot(x, y) {
+        const dot = document.getElementById('gazeDot');
+        if (!dot) return;
+
+        latestGaze.x = x;
+        latestGaze.y = y;
+        latestInteractionGaze.x = x;
+        latestInteractionGaze.y = y;
+
+        dot.style.left = x + "px";
+        dot.style.top = y + "px";
+    }
+
+    function updateManualCursorPosition(x, y) {
+        manualPointer.x = clamp(x, 0, window.innerWidth);
+        manualPointer.y = clamp(y, 0, window.innerHeight);
+
+        if (!manualCursorMode) return;
+
+        moveGazeDot(manualPointer.x, manualPointer.y);
+        updateTargeting(manualPointer.x, manualPointer.y, true, getStableTarget(manualPointer.x, manualPointer.y));
+    }
+
+    function toggleManualCursorMode() {
+        manualCursorMode = !manualCursorMode;
+        document.body.classList.toggle("manual-cursor-mode", manualCursorMode);
+
+        if (manualCursorMode) {
+            resetGazeFilters();
+            updateManualCursorPosition(manualPointer.x, manualPointer.y);
+            trackingStatus.textContent = "Mouse-dot mode on. Press ` again for gaze mode.";
+        } else {
+            setTargetHighlight(null, false);
+            trackingStatus.textContent = calibrationComplete
+                ? "Gaze mode on. Gaze to a button, then blink to select."
+                : "Gaze mode on. Finish gaze calibration.";
+        }
+    }
+
+    document.addEventListener("mousemove", (e) => {
+        updateManualCursorPosition(e.clientX, e.clientY);
+    });
+
+    document.addEventListener("keydown", (e) => {
+        if (e.code === "Backquote" || e.key === "`") {
+            e.preventDefault();
+            toggleManualCursorMode();
+            return;
+        }
+
+        if (e.key === "m" || e.key === "M") toggleMode();
+        if (e.key === "l" || e.key === "L") toggleLogging();
+        if (e.key === "e" || e.key === "E") exportLogs();
+    });
+
+    /**********************************************************************
+     * MAIN
+     **********************************************************************/
+    window.addEventListener("load", async () => {
+        const dot = document.getElementById('gazeDot');
+
+        dot.style.position = "fixed";
+        dot.style.left = "0px";
+        dot.style.top = "0px";
+        dot.style.width = dot.style.width || "14px";
+        dot.style.height = dot.style.height || "14px";
+        dot.style.borderRadius = dot.style.borderRadius || "50%";
+        dot.style.zIndex = "999999";
+        dot.style.pointerEvents = "none";
+        dot.style.transform = "translate(-50%, -50%)";
+
+        recalibrateBtn.addEventListener("click", () => {
+            localStorage.setItem("savedText", textBox.value);
+            location.reload();
+        });
+
+        const savedText = localStorage.getItem("savedText");
+
+        if (savedText) {
+            textBox.value = savedText;
+            localStorage.removeItem("savedText");
+        }
+
+        if (typeof webgazer === "undefined") {
+            console.error("WebGazer is undefined. Script did not load.");
+            trackingStatus.textContent = "WebGazer failed to load.";
+            return;
+        }
+
+        try {
+            if (typeof webgazer.saveDataAcrossSessions === "function") {
+                webgazer.saveDataAcrossSessions(false);
+            }
+
+            if (typeof webgazer.clearData === "function") {
+                webgazer.clearData();
+            }
+        } catch (e) {
+            console.warn("Could not clear previous WebGazer calibration data:", e);
+        }
+
+        /******** Calibration UI ********/
+        const calibrationContainer = document.createElement('div');
+        calibrationContainer.id = 'calibration-container';
+        document.body.appendChild(calibrationContainer);
+
+        const positions = [
+            [10,10],[50,10],[90,10],
+            [10,50],[50,50],[90,50],
+            [10,90],[50,90],[90,90]
+        ];
+
+        let clickCounts = {};
+
+        positions.forEach((pos, i) => {
+            const c = document.createElement('div');
+            c.classList.add('calibration-dot');
+            c.style.left = pos[0] + 'vw';
+            c.style.top = pos[1] + 'vh';
+            calibrationContainer.appendChild(c);
+            clickCounts[i] = 0;
+
+            c.addEventListener('click', () => {
+                const screenPoint = {
+                    x: window.innerWidth * (pos[0] / 100),
+                    y: window.innerHeight * (pos[1] / 100)
+                };
+
+                if (clickCounts[i] > 0 && !recordCalibrationSample(screenPoint)) {
+                    trackingStatus.textContent = "Look at the dot for a moment, then click it again.";
+                    return;
+                }
+
+                clickCounts[i]++;
+                c.style.opacity = 1 - (clickCounts[i] / 3);
+
+                if (clickCounts[i] >= 3) c.remove();
+
+                if (Object.values(clickCounts).every(v => v >= 3)) {
+                    finalizeCalibrationModel();
+                    lockWebgazerTraining();
+                    calibrationContainer.remove();
+                    calibrationComplete = true;
+                    trackingStatus.textContent = "Calibration locked. Gaze to a button, then blink to select.";
+                    console.log("Calibration complete");
+                }
+            });
+        });
+
+        /******** WebGazer ********/
+        webgazer.setRegression('ridge');
+
+        let activeTracker = "clmtrackr";
+
+        try {
+            webgazer.setTracker('TFFacemesh');
+            activeTracker = "TFFacemesh";
+            console.log("WebGazer tracker: TFFacemesh");
+        } catch (e) {
+            console.warn("TFFacemesh tracker unavailable, using clmtrackr:", e);
+            webgazer.setTracker('clmtrackr');
+        }
+
+        try {
+            webgazer.applyKalmanFilter(true);
+        } catch (e) {
+            console.warn("WebGazer Kalman filter not available:", e);
+        }
+
+        webgazer.setGazeListener((data, timestamp) => {
+            if (!data || typeof data.x !== "number" || typeof data.y !== "number") return;
+
+            const timestampMs = Number.isFinite(timestamp) ? timestamp : performance.now();
+            const rawPoint = { x: data.x, y: data.y };
+
+            rememberRawSample(rawPoint);
+
+            if (manualCursorMode) return;
+
+            const correctedRawPoint = applyCalibrationCorrection(rawPoint);
+
+            addToWindow(correctedRawPoint.x, correctedRawPoint.y);
+
+            const candidate = windowMedianPoint();
+
+            if (isOutlierBySpeed(candidate, timestampMs)) return;
+
+            const rawSpeed = movementSpeed(candidate, timestampMs);
+
+            lastAccepted = candidate;
+            lastTimestamp = timestampMs;
+
+            const smoothedPoint = emaUpdate(candidate, rawSpeed);
+            const filteredSpeed = filteredMovementSpeed(smoothedPoint, timestampMs);
+            const fixating = updateFixationState(filteredSpeed);
+            lastFixationPoint = { x: smoothedPoint.x, y: smoothedPoint.y };
+            lastFixationTimestamp = timestampMs;
+            const stableTarget = calibrationComplete ? getStableTarget(smoothedPoint.x, smoothedPoint.y) : null;
+            updateDriftCorrection(smoothedPoint, stableTarget, fixating);
+            const interactionPoint = applyTargetStabilization(smoothedPoint, stableTarget, fixating);
+
+            if (LOGGING) {
+                rawLog.push({ t: timestampMs, x: rawPoint.x, y: rawPoint.y });
+                smoothLog.push({
+                    t: timestampMs,
+                    x: smoothedPoint.x,
+                    y: smoothedPoint.y,
+                    correctedX: correctedRawPoint.x,
+                    correctedY: correctedRawPoint.y,
+                    interactionX: interactionPoint.x,
+                    interactionY: interactionPoint.y,
+                    driftX: driftOffset.x,
+                    driftY: driftOffset.y,
+                    rawSpeed,
+                    filteredSpeed,
+                    fixation: fixating
+                });
+            }
+
+            latestInteractionGaze.x = interactionPoint.x;
+            latestInteractionGaze.y = interactionPoint.y;
+
+            const visualPoint = visualDotUpdate(interactionPoint);
+            const dotOut = (MODE === "raw") ? rawPoint : visualPoint;
+
+            latestGaze.x = dotOut.x;
+            latestGaze.y = dotOut.y;
+
+            dot.style.left = dotOut.x + "px";
+            dot.style.top = dotOut.y + "px";
+
+            updateTargeting(interactionPoint.x, interactionPoint.y, fixating, stableTarget);
+        });
+
+        try {
+            await webgazer.begin();
+        } catch (e) {
+            if (activeTracker !== "clmtrackr") {
+                console.warn("WebGazer failed with TFFacemesh, retrying with clmtrackr:", e);
+                activeTracker = "clmtrackr";
+                webgazer.setTracker('clmtrackr');
+                await webgazer.begin();
+            } else {
+                throw e;
+            }
+        }
+
+        webgazer.showVideoPreview(true)
+            .showPredictionPoints(false)
+            .showFaceOverlay(false)
+            .showFaceFeedbackBox(false);
+
+        const videoEl = await waitForWebgazerVideo();
+        positionCameraOverlay(videoEl);
+
+        console.log("WebGazer started");
+
+        /******** Blink Detection ********/
+        if (typeof FaceMesh === "undefined") {
+            console.error("MediaPipe FaceMesh not loaded. Blink detection disabled.");
+            trackingStatus.textContent = "FaceMesh failed to load. Mouse clicks still work.";
+            return;
+        }
+
+        if (!videoEl) {
+            console.error("WebGazer video feed not ready. Blink detection disabled.");
+            trackingStatus.textContent = "Video feed unavailable. Mouse clicks still work.";
+            return;
+        }
+
+        const faceMesh = new FaceMesh({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+        });
+
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            refineLandmarks: true,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+
+        let debugCount = 0;
+
+        faceMesh.onResults((results) => {
+            if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+                blinkFrames = 0;
+                return;
+            }
+
+            const lm = results.multiFaceLandmarks[0];
+            const w = videoEl.videoWidth || 640;
+            const h = videoEl.videoHeight || 480;
+
+            const leftEAR = eyeEAR(lm, LEFT_EYE, w, h);
+            const rightEAR = eyeEAR(lm, RIGHT_EYE, w, h);
+            const ear = (leftEAR + rightEAR) / 2;
+
+            if (baselineEar == null) {
+                if (ear > 0.10 && ear < 0.50) baselineEars.push(ear);
+
+                if (debugCount < 8) {
+                    console.log("EAR baseline sample:", ear.toFixed(3));
+                    debugCount++;
+                }
+
+                return;
+            }
+
+            const threshold = baselineEar * BLINK_RATIO;
+            const now = Date.now();
+
+            if (ear < threshold) {
+                blinkFrames++;
+            } else {
+                blinkFrames = 0;
+            }
+
+            if (blinkFrames >= CLOSED_FRAMES_REQUIRED && (now - lastBlinkTime) > BLINK_COOLDOWN_MS) {
+                lastBlinkTime = now;
+                blinkFrames = 0;
+                console.log("Blink detected. EAR:", ear.toFixed(3), "threshold:", threshold.toFixed(3));
+                clickCurrentTarget();
+            }
+        });
+
+        await startBlinkDetection(faceMesh, videoEl);
+        console.log("Blink detection started");
+    });
+    </script>
+</body>
+</html>
